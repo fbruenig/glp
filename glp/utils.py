@@ -1,7 +1,7 @@
 from jax import jit, vmap
 import jax.numpy as jnp
 from functools import partial
-
+import numbers
 
 @partial(jit, static_argnums=2)
 def boolean_mask_1d(masked, mask, out_size, filler):
@@ -31,10 +31,9 @@ def cast(x):
     In high-precision situations, jax type promotion should™
     do the right thing.
     """
-
-    if type(x) == int:
+    if isinstance(x, numbers.Integral):
         return jnp.array(x, dtype=jnp.int32)
-    elif type(x) == float:
+    elif isinstance(x, numbers.Real):
         return jnp.array(x, dtype=jnp.float32)
     else:
         raise ValueError(f"cannot cast {x} of as type {type(x)} is unknown to me")
