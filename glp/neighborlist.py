@@ -228,6 +228,9 @@ def quadratic_neighbor_list(cell, cutoff,  skin, capacity_multiplier=1.25, use_c
             centers, _ = boolean_mask_1d(centers, mask, size, N)
             others, overflow = boolean_mask_1d(others, mask, size, N)
             overflow = overflow | cell_too_small(cell)
+            if cl is not None:
+                # an over-full or too-small cell list gives an incomplete list: report it
+                overflow = overflow | cl.reallocate
             return Neighbors(centers, others, idx_i_lr, idx_j_lr, overflow, positions, cl)
 
         # if we need an update, call update(), else do a no-op and return input
@@ -386,49 +389,47 @@ def cell_list(cell, cutoff, buffer_size_multiplier=1.25, bin_size_multiplier=1):
         return CellList(cell_id, overflow, cell_capacity, cell_size, cells_per_side)
     
     def update_fn(positions, old_cell_list, new_cell):
-        # this is jittable,
-        # CellList tells us all the shapes we need
-        # If cell size is lower than cutoff, we need to reallocate cell list
-        # Rellocate is not jitable, we're changing shapes
-        # So, after each update we need to check if we need to reallocate
+        # this is jittable: the CellList fixes all shapes. Reallocation changes shapes and is not,
+        # so update_fn only *flags* it (CellList.reallocate) and the caller has to reallocate.
         N = positions.shape[0]
+        box = cell if new_cell is None else new_cell
 
-        cell_size = jnp.where(old_cell_list.cells_per_side != 0, cell / old_cell_list.cells_per_side, cell)
-        #TODO: check if we need to check max_occupancy every update, seems excessive
-        max_occupancy = estimate_cell_capacity(positions, new_cell, cell_size, buffer_size_multiplier)
-        # Checking if update or reallocate
-        reallocate = jnp.all(get_heights(cell_size).any() >= cutoff) & (max_occupancy <= old_cell_list.capacity)
+        # static shapes: id is (cells_x, cells_y, cells_z, capacity, 1)
+        capacity = old_cell_list.id.shape[-2]
+        cell_count = int(np.prod(old_cell_list.id.shape[:-2]))
+        cell_size = jnp.where(old_cell_list.cells_per_side != 0, box / old_cell_list.cells_per_side, box)
 
-        def update(positions, old_cell_list):
-            hash_multipliers = compute_hash_constants(old_cell_list.cells_per_side)
-            indices = jnp.array(jnp.floor(jnp.dot(positions, inv33(cell_size).T)), dtype = jnp.int32)
+        hash_multipliers = compute_hash_constants(old_cell_list.cells_per_side)
+        indices = jnp.array(jnp.floor(jnp.dot(positions, inv33(cell_size).T)), dtype = jnp.int32)
 
-            # Some particles are in the edge and might have negative indices or larger than cells_per_side
-            # We need to correct them wrapping into cell per side vector
-            indices = jnp.rint(wrap(old_cell_list.cells_per_side, indices))#.astype(jnp.int32)
-            
-            hashes = jnp.sum(indices * hash_multipliers, axis=1, dtype=jnp.int32)
-            particle_id = iota(jnp.int32, N)
-            sort_map = jnp.argsort(hashes)
-            sorted_hash = hashes[sort_map]
-            sorted_id = particle_id[sort_map]
+        # Some particles are in the edge and might have negative indices or larger than cells_per_side
+        # We need to correct them wrapping into cell per side vector
+        indices = jnp.rint(wrap(old_cell_list.cells_per_side, indices))#.astype(jnp.int32)
 
-            sorted_cell_id = jnp.mod(iota(jnp.int32, N), old_cell_list.capacity)
-            sorted_cell_id = sorted_hash * old_cell_list.capacity + sorted_cell_id
-            sorted_id = jnp.reshape(sorted_id, (N, 1))
-            cell_id = N * jnp.ones((old_cell_list.id.reshape(-1, 1).shape), dtype = jnp.int32)
-            cell_id = cell_id.at[sorted_cell_id].set(sorted_id)
+        hashes = jnp.sum(indices * hash_multipliers, axis=1, dtype=jnp.int32)
+        particle_id = iota(jnp.int32, N)
+        sort_map = jnp.argsort(hashes)
+        sorted_hash = hashes[sort_map]
+        sorted_id = particle_id[sort_map]
 
-            # This is not jitable, we're changing shapes. It's a fix for the unflatten_cell_buffer.
-            
-            cell_id = jax.pure_callback(unflatten_cell_buffer, old_cell_list.id, cell_id, old_cell_list.cells_per_side)
-            return CellList(cell_id, old_cell_list.reallocate, old_cell_list.capacity, cell_size, old_cell_list.cells_per_side)
-        
-        # In case cell size is lower than cutoff, we need to reallocate 
-        def need_reallocate(_ ,old_cell_list):
-            return CellList(old_cell_list.id, True, old_cell_list.capacity, cell_size, old_cell_list.cells_per_side)
-        return cond(reallocate, need_reallocate, update, positions, old_cell_list)
-    return allocate_fn, update_fn 
+        sorted_cell_id = jnp.mod(iota(jnp.int32, N), capacity)
+        sorted_cell_id = sorted_hash * capacity + sorted_cell_id
+        sorted_id = jnp.reshape(sorted_id, (N, 1))
+        cell_id = N * jnp.ones((old_cell_list.id.reshape(-1, 1).shape), dtype = jnp.int32)
+        cell_id = cell_id.at[sorted_cell_id].set(sorted_id)
+
+        # This is not jitable, we're changing shapes. It's a fix for the unflatten_cell_buffer.
+        cell_id = jax.pure_callback(unflatten_cell_buffer, old_cell_list.id, cell_id, old_cell_list.cells_per_side)
+
+        # The list above is only valid if no cell holds more atoms than its capacity (extra atoms
+        # overwrite each other's slots and drop out of the list) and the cells are still at least
+        # one cutoff wide (the 27-cell stencil then covers every neighbour). Otherwise flag it; the
+        # flag stays set until the caller reallocates.
+        occupancy = ops.segment_sum(jnp.ones_like(hashes), hashes, cell_count)
+        invalid = (jnp.max(occupancy) > capacity) | jnp.any(get_heights(cell_size) < cutoff)
+        return CellList(cell_id, old_cell_list.reallocate | invalid, old_cell_list.capacity, cell_size,
+                        old_cell_list.cells_per_side)
+    return allocate_fn, update_fn
 
 
 def estimate_cell_capacity(positions, cell, cell_size, buffer_size_multiplier):
